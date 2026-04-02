@@ -1,24 +1,26 @@
 # 🫥 isotopes-core PRD
 
-> Version: 0.1.0
+> Version: 0.2.0
 > Date: 2026-04-02
 > Status: **Draft**
+> Stack: **TypeScript** (changed from Python)
 
 ## Overview
 
-**isotopes-core** is a standalone Python library providing a pluggable agent loop engine. It is the core of the Isotopes framework, usable independently or embedded in other applications.
+**isotopes-core** is a standalone TypeScript library providing a pluggable agent loop engine. It is the core of the Isotopes framework, usable independently or embedded in other applications.
 
 ## Goals
 
 1. **Minimal core** — Only essential agent loop components, no I/O, no CLI, no persistence
 2. **Pluggable** — Configure provider, tools, middleware via dependency injection
 3. **Zero runtime deps** — No mandatory dependencies beyond LLM SDKs
-4. **Type-safe** — Full type hints, mypy/pyright compatible
+4. **Type-safe** — Full TypeScript types, strict mode compatible
+5. **Tree-shakeable** — ESM-only, no side effects in core modules
 
 ## Non-Goals
 
 - ❌ CLI / TUI
-- ❌ Session persistence
+- ❌ Session persistence (JSONL, SQLite, etc.)
 - ❌ Concrete tools (bash, read, write, etc.)
 - ❌ RPC protocol
 - ❌ Skill system
@@ -32,183 +34,209 @@ These belong in the upper-level `isotopes` package.
 
 ```
 isotopes-core/
-├── agent.py       # Agent class: state management, prompt(), continue_()
-├── loop.py        # agent_loop(): core loop (plan → act → observe)
-├── context.py     # Context management, pruning strategies
-├── tools.py       # Tool definition, @auto_tool decorator
-├── events.py      # Event types (AgentEvent stream)
-├── middleware.py  # Lifecycle hooks
-├── types.py       # Core type definitions
-└── providers/     # LLM provider abstraction
-    ├── base.py    # Provider interface
-    ├── anthropic.py
-    ├── openai.py
-    ├── proxy.py   # Generic OpenAI-compatible proxy
-    └── router.py  # Multi-provider routing
+├── src/
+│   ├── index.ts           # Public API exports
+│   ├── agent.ts           # Agent class: state management, prompt(), continue()
+│   ├── loop.ts            # agentLoop(): core async generator
+│   ├── context.ts         # Context management, pruning strategies
+│   ├── tools.ts           # Tool definition, schema generation
+│   ├── events.ts          # Event types (discriminated union)
+│   ├── middleware.ts      # Lifecycle hooks
+│   ├── types.ts           # Core type definitions
+│   └── providers/
+│       ├── index.ts       # Provider exports
+│       ├── types.ts       # Provider protocol (interface)
+│       ├── anthropic.ts   # Anthropic Claude
+│       ├── openai.ts      # OpenAI GPT
+│       └── proxy.ts       # OpenAI-compatible endpoints
+├── package.json
+└── tsconfig.json
 ```
 
 ## Core Components
 
-### 1. Agent Class
+### 1. EventStream
 
-```python
-from isotopes_core import Agent, auto_tool
+We use a push-based event stream:
 
-# Create agent
-agent = Agent(
-    provider=AnthropicProvider(api_key="..."),
-    system_prompt="You are a helpful assistant.",
-    tools=[my_tool],
-    max_turns=10,
-)
+```typescript
+interface EventStream<TEvent, TResult> {
+  [Symbol.asyncIterator](): AsyncIterator<TEvent>;
+  result(): Promise<TResult>;
+}
 
-# Send message and stream events
-async for event in agent.prompt("Hello!"):
-    match event:
-        case TextDelta(text=t):
-            print(t, end="", flush=True)
-        case ToolCall(name=n, arguments=a):
-            print(f"Calling {n}({a})")
-        case AgentDone():
-            print("Done!")
+// Usage
+const stream = agent.prompt("Hello!");
+for await (const event of stream) {
+  if (event.type === "text_delta") {
+    process.stdout.write(event.text);
+  }
+}
+const messages = await stream.result();
 ```
 
-### 2. Agent Loop
+### 2. Agent Class
 
-Core loop logic (in `loop.py`):
+```typescript
+import { Agent, tool } from "isotopes-core";
+import { AnthropicProvider } from "isotopes-core/providers/anthropic";
+
+const greet = tool({
+  name: "greet",
+  description: "Greet someone",
+  parameters: { name: { type: "string" } },
+  execute: async ({ name }) => `Hello, ${name}!`,
+});
+
+const agent = new Agent({
+  provider: new AnthropicProvider({ apiKey: "..." }),
+  systemPrompt: "You are a helpful assistant.",
+  tools: [greet],
+  maxTurns: 10,
+});
+
+// Stream events
+for await (const event of agent.prompt("Say hi to Alice")) {
+  console.log(event);
+}
+```
+
+### 3. Agent Loop
+
+Core loop in `loop.ts`:
 
 ```
 1. Receive user message
-2. Build context (system prompt + history + tools)
-3. Call LLM
-4. If tool calls:
-   a. Execute tools (parallel or sequential)
-   b. Add results to history
-   c. Go to step 3
-5. If no tool calls: return final response
+2. Apply transformContext() if configured
+3. Convert to LLM format via convertToLlm()
+4. Call provider.complete()
+5. Stream response, yielding events
+6. If tool calls:
+   a. Execute tools (parallel by default)
+   b. Yield tool results
+   c. Append to context
+   d. Check max_turns
+   e. Go to step 2
+7. If no tool calls: yield AgentDone, return
 ```
 
-### 3. Tool Definition
+### 4. Events (Discriminated Union)
 
-Two styles supported:
+```typescript
+type AgentEvent =
+  | { type: "agent_start" }
+  | { type: "turn_start" }
+  | { type: "text_delta"; text: string }
+  | { type: "tool_call"; id: string; name: string; arguments: unknown }
+  | { type: "tool_result"; id: string; content: Content[]; isError: boolean }
+  | { type: "turn_end"; hasToolCalls: boolean }
+  | { type: "agent_done"; messages: Message[]; usage: Usage }
+  | { type: "agent_error"; error: Error; messages: Message[] };
+```
 
-```python
-# Style 1: @auto_tool (recommended, auto-generates schema from type hints)
-@auto_tool
-async def search(pattern: str, path: str = ".", max_results: int = 10) -> str:
-    """Search for a pattern in files.
-    
-    Args:
-        pattern: Regex pattern to search for.
-        path: Directory to search in.
-        max_results: Maximum number of results.
-    """
-    ...
+### 5. Tool Definition
 
-# Style 2: Manual schema
-@tool(
-    name="search",
-    description="Search for a pattern",
-    parameters={
-        "type": "object",
-        "properties": {
-            "pattern": {"type": "string"},
-            "path": {"type": "string", "default": "."},
-        },
-        "required": ["pattern"],
+```typescript
+// Option 1: Object-based definition
+const search = tool({
+  name: "search",
+  description: "Search the web",
+  parameters: {
+    query: { type: "string", description: "Search query" },
+    maxResults: { type: "number", default: 10 },
+  },
+  execute: async ({ query, maxResults }) => {
+    return `Results for: ${query}`;
+  },
+});
+
+// Option 2: Zod schema (via isotopes-core/zod)
+import { z } from "zod";
+import { zodTool } from "isotopes-core/zod";
+
+const search = zodTool({
+  name: "search",
+  description: "Search the web",
+  parameters: z.object({
+    query: z.string(),
+    maxResults: z.number().default(10),
+  }),
+  execute: async ({ query, maxResults }) => {
+    return `Results for: ${query}`;
+  },
+});
+```
+
+### 6. Provider Protocol
+
+```typescript
+interface Provider {
+  complete(
+    messages: Message[],
+    options: {
+      systemPrompt?: string;
+      tools?: Tool[];
+      temperature?: number;
+      maxTokens?: number;
+      signal?: AbortSignal;
     }
-)
-async def search(tool_call_id, params, signal, on_update):
-    ...
+  ): AsyncGenerator<StreamEvent, void, unknown>;
+}
+
+type StreamEvent =
+  | { type: "message_start"; usage?: Usage }
+  | { type: "content_block_start"; index: number; blockType: "text" | "tool_use"; toolCallId?: string; toolName?: string }
+  | { type: "content_block_delta"; index: number; text?: string; partialJson?: string }
+  | { type: "content_block_stop"; index: number }
+  | { type: "message_delta"; stopReason?: string; usage?: Usage }
+  | { type: "message_stop" };
 ```
 
-### 4. Provider Abstraction
+### 7. Middleware / Hooks
 
-```python
-class Provider(Protocol):
-    async def complete(
-        self,
-        messages: list[Message],
-        tools: list[Tool] | None = None,
-        temperature: float | None = None,
-        max_tokens: int | None = None,
-    ) -> AsyncGenerator[StreamEvent, None]:
-        ...
+```typescript
+const agent = new Agent({
+  // ...
+  hooks: {
+    onAgentStart: (ctx) => console.log("Started"),
+    onAgentEnd: (ctx, messages) => console.log("Done"),
+    onTurnStart: (ctx, turn) => console.log(`Turn ${turn}`),
+    onTurnEnd: (ctx, turn) => console.log(`Turn ${turn} complete`),
+    beforeToolCall: (tool, args) => args, // Can modify args or throw to block
+    afterToolCall: (tool, result) => result, // Can modify result
+    transformContext: (messages) => messages, // Pre-LLM transform
+  },
+});
 ```
 
-Built-in providers:
-- `AnthropicProvider` — Anthropic Claude API
-- `OpenAIProvider` — OpenAI API
-- `ProxyProvider` — Any OpenAI-compatible endpoint (ollama, vllm)
-- `RouterProvider` — Route to different providers by model name
+### 8. Context Management
 
-### 5. Events
+```typescript
+import { Context, pruneOldest, pruneSummarize } from "isotopes-core";
 
-```python
-@dataclass
-class TextDelta:
-    text: str
+const context = new Context({
+  maxTokens: 100_000,
+  pruningStrategy: pruneOldest({ keepLast: 10 }),
+});
 
-@dataclass
-class ToolCall:
-    id: str
-    name: str
-    arguments: dict[str, Any]
+context.addMessage({ role: "user", content: [{ type: "text", text: "Hello" }] });
 
-@dataclass
-class ToolResult:
-    id: str
-    content: list[TextContent | ImageContent]
-    is_error: bool
-
-@dataclass
-class AgentDone:
-    messages: list[Message]  # Full history
-    usage: Usage | None
-```
-
-### 6. Middleware / Hooks
-
-```python
-agent = Agent(
-    ...,
-    on_agent_start=lambda ctx: print("Agent started"),
-    on_agent_end=lambda ctx, result: print(f"Done: {result}"),
-    on_turn_start=lambda ctx, turn: print(f"Turn {turn}"),
-    on_turn_end=lambda ctx, turn: print(f"Turn {turn} complete"),
-    before_tool_call=lambda tool, args: print(f"Calling {tool}"),
-    after_tool_call=lambda tool, result: print(f"Result: {result}"),
-    transform_context=lambda ctx: ctx,  # Can modify context
-)
-```
-
-### 7. Context Management
-
-```python
-from isotopes_core import Context, PruningStrategy
-
-# Context contains full message history
-ctx = Context(
-    system_prompt="...",
-    messages=[...],
-    max_tokens=100_000,
-    pruning_strategy=PruningStrategy.SLIDING_WINDOW,  # or SUMMARIZE
-)
-
-# Auto pruning
-ctx.add_message(new_message)
-if ctx.needs_pruning():
-    ctx.prune()
+if (context.needsPruning()) {
+  await context.prune();
+}
 ```
 
 ---
 
-## API Design Principles
+## TypeScript Design Principles
 
-1. **Async-first** — All I/O operations are async
-2. **Generator-based** — prompt() returns AsyncGenerator for streaming
-3. **Immutable messages** — Message objects are frozen dataclasses
-4. **Explicit over implicit** — No hidden global state
+1. **ESM-only** — No CommonJS, enables tree-shaking
+2. **Strict mode** — `strict: true` in tsconfig
+3. **Discriminated unions** — For events and content types
+4. **Generics** — For provider-specific options
+5. **No classes where unnecessary** — Prefer functions and interfaces
+6. **Async generators** — For streaming (not callbacks)
+7. **AbortSignal** — For cancellation throughout
 
 ---
 
@@ -216,59 +244,84 @@ if ctx.needs_pruning():
 
 | Module | Lines | Description |
 |--------|-------|-------------|
-| agent.py | ~400 | Agent class, state management |
-| loop.py | ~900 | Core loop logic |
-| context.py | ~500 | Context, pruning |
-| tools.py | ~500 | Tool, @auto_tool |
-| events.py | ~150 | Event types |
-| middleware.py | ~250 | Hook definitions |
-| types.py | ~200 | Core types |
-| providers/ | ~700 | 4 providers |
-| **Total** | **~3,600 lines** | |
+| agent.ts | ~300 | Agent class, state management |
+| loop.ts | ~400 | Core loop logic |
+| context.ts | ~300 | Context, pruning |
+| tools.ts | ~250 | Tool definition, schema |
+| events.ts | ~80 | Event types |
+| middleware.ts | ~100 | Hook definitions |
+| types.ts | ~150 | Core types |
+| providers/ | ~600 | 3 providers |
+| **Total** | **~2,200 lines** | |
 
----
-
-## Reference Implementations
-
-- https://github.com/GhostComplex/project-agent-core — Current prototype
-- https://github.com/badlogic/pi-mono — LLM loop reference
-- https://github.com/steins-z/claude-code — Claude Code CLI reference
-
----
-
-## Milestones
-
-### M0: Core Loop (~900 lines)
-- `loop.py` — agent_loop() implementation
-
-### M1: Agent Wrapper (~900 lines)
-- `agent.py` — Agent class
-- `context.py` — Context management + pruning
-
-### M2: Providers (~600 lines)
-- `providers/anthropic.py`
-- `providers/openai.py`
-- `providers/proxy.py`
-
-### M3: Polish (~300 lines)
-- `providers/router.py` — Multi-provider routing
-- 100% type coverage + documentation
+Note: TypeScript is more concise than Python for this use case due to:
+- No runtime type validation boilerplate (types are compile-time)
+- Discriminated unions vs dataclasses
+- Async/await syntax differences
 
 ---
 
 ## Dependencies
 
-```toml
-[project]
-dependencies = []
-
-[project.optional-dependencies]
-anthropic = ["anthropic>=0.40"]
-openai = ["openai>=1.50"]
-all = ["anthropic>=0.40", "openai>=1.50"]
+```json
+{
+  "dependencies": {},
+  "peerDependencies": {
+    "anthropic": ">=0.40.0",
+    "openai": ">=4.70.0"
+  },
+  "peerDependenciesMeta": {
+    "anthropic": { "optional": true },
+    "openai": { "optional": true }
+  }
+}
 ```
 
-Core package has **zero dependencies**; providers are optional.
+Core package has **zero dependencies**; SDK packages are peer dependencies.
+
+---
+
+## Package Structure
+
+```json
+{
+  "name": "isotopes-core",
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js",
+    "./providers/anthropic": "./dist/providers/anthropic.js",
+    "./providers/openai": "./dist/providers/openai.js",
+    "./providers/proxy": "./dist/providers/proxy.js",
+    "./zod": "./dist/zod.js"
+  }
+}
+```
+
+---
+
+## Milestones
+
+### M0: Core Loop (~800 lines)
+- `types.ts` — Message, Content, Usage
+- `events.ts` — AgentEvent discriminated union
+- `tools.ts` — Tool definition, schema generation
+- `loop.ts` — `agentLoop()` async generator
+- `providers/types.ts` — Provider interface, StreamEvent
+
+### M1: Agent Wrapper (~600 lines)
+- `agent.ts` — Agent class
+- `context.ts` — Context management + pruning
+- `middleware.ts` — Hooks
+
+### M2: Providers (~600 lines)
+- `providers/anthropic.ts`
+- `providers/openai.ts`
+- `providers/proxy.ts`
+
+### M3: Polish (~200 lines)
+- `zod.ts` — Zod integration for tool schemas
+- JSDoc documentation
+- README examples
 
 ---
 
@@ -276,20 +329,24 @@ Core package has **zero dependencies**; providers are optional.
 
 ```bash
 # Core only (for custom providers)
-pip install isotopes-core
+npm install isotopes-core
 
 # With Anthropic provider
-pip install isotopes-core[anthropic]
+npm install isotopes-core anthropic
 
-# All providers
-pip install isotopes-core[all]
+# With OpenAI provider
+npm install isotopes-core openai
 ```
 
-```python
-from isotopes_core import Agent
-from isotopes_core.providers.anthropic import AnthropicProvider
+```typescript
+import { Agent } from "isotopes-core";
+import { AnthropicProvider } from "isotopes-core/providers/anthropic";
 
-agent = Agent(provider=AnthropicProvider())
-async for event in agent.prompt("Hello"):
-    print(event)
+const agent = new Agent({
+  provider: new AnthropicProvider(),
+});
+
+for await (const event of agent.prompt("Hello")) {
+  console.log(event);
+}
 ```

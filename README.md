@@ -1,6 +1,6 @@
 # 🫥 isotopes-core
 
-A minimal, pluggable Python agent loop engine.
+A minimal, pluggable TypeScript agent loop engine.
 
 ## Overview
 
@@ -8,8 +8,8 @@ A minimal, pluggable Python agent loop engine.
 
 - Agent loop (plan → act → observe → repeat)
 - LLM provider abstraction (Anthropic, OpenAI, proxy)
-- `@auto_tool` decorator for zero-boilerplate tool definitions
-- Typed event streaming
+- Type-safe tool definitions with schema generation
+- Streaming events via async generators
 - Context management with pruning strategies
 - Composable middleware/hooks
 
@@ -25,6 +25,36 @@ This is a **core library**, not a full agent framework. It does NOT include:
 - MCP integration
 
 For those, see the main [isotopes](https://github.com/GhostComplex/isotopes) package.
+
+## Quick Start
+
+```bash
+npm install isotopes-core anthropic
+```
+
+```typescript
+import { Agent, tool } from "isotopes-core";
+import { AnthropicProvider } from "isotopes-core/providers/anthropic";
+
+const greet = tool({
+  name: "greet",
+  description: "Greet someone by name",
+  parameters: { name: { type: "string" } },
+  execute: async ({ name }) => `Hello, ${name}!`,
+});
+
+const agent = new Agent({
+  provider: new AnthropicProvider(),
+  systemPrompt: "You are a friendly assistant.",
+  tools: [greet],
+});
+
+for await (const event of agent.prompt("Say hi to Alice")) {
+  if (event.type === "text_delta") {
+    process.stdout.write(event.text);
+  }
+}
+```
 
 ## Documentation
 
